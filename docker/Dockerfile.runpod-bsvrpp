@@ -1,0 +1,65 @@
+ARG BASE_IMAGE="runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
+FROM ${BASE_IMAGE}
+
+# Use bash for RUN steps
+SHELL ["/bin/bash", "-lc"]
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1
+
+# System deps: ffmpeg for pre/post, build tools for mmcv ops, and basic libs needed by OpenCV/MMCV
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg git build-essential ninja-build \
+    libgl1 libsm6 libxext6 libxrender1 libglib2.0-0 \
+    ca-certificates curl pkg-config \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# Dedicated venv so we don't mutate the base image's site-packages
+RUN python3.11 -m venv /opt/bsvrpp-venv
+ENV PATH="/opt/bsvrpp-venv/bin:${PATH}"
+RUN python -m pip install --upgrade pip setuptools wheel
+
+# Torch 2.6.0 + CUDA 12.4, plus torchvision/torchaudio pinned from plan.md
+ARG TORCH_VER=2.6.0
+ARG VISION_VER=0.21.0
+ARG AUDIO_VER=2.6.0
+RUN pip install --index-url https://download.pytorch.org/whl/cu124 \
+    torch==${TORCH_VER}+cu124 torchvision==${VISION_VER}+cu124 torchaudio==${AUDIO_VER}+cu124
+
+# Core scientific stack pinned from plan.md
+RUN pip install \
+    "numpy==2.2.6" \
+    "scipy==1.16.2" \
+    "opencv-python==4.12.0.88"
+
+# Compile mmcv-full against Torch/CUDA in this image
+RUN pip install --no-binary=mmcv-full "mmcv-full==1.7.2"
+
+# Clone your BasicVSR++ fork and install in editable mode (no deps). Parameterized for flexibility.
+ARG BSVRPP_REPO=https://github.com/0xmrwn/basicvsrpp
+ARG BSVRPP_REF=master
+RUN git clone --depth=1 --branch ${BSVRPP_REF} ${BSVRPP_REPO} /opt/BasicVSR_PlusPlus
+WORKDIR /opt/BasicVSR_PlusPlus
+
+RUN pip install --no-deps -e .
+
+# Optionally include the baseline streaming runner from this repo context for convenience
+# If the file is missing at build time, COPY will fail; keep it in tools/ as per repo
+COPY tools/restoration_video_streaming.py /workspace/restoration_video_streaming.py
+
+# Simple startup that activates venv, prints versions, then tails by default (RunPod-compatible)
+RUN printf '%s\n' '#!/usr/bin/env bash' \
+    'set -e' \
+    'source /opt/bsvrpp-venv/bin/activate' \
+    'echo "Python: $(python -V)"' \
+    'python - <<PY' \
+    'import torch, mmcv; print("Torch:", torch.__version__, "CUDA:", torch.version.cuda); print("MMCV:", mmcv.__version__)' \
+    'PY' \
+    'if [[ $# -gt 0 ]]; then exec "$@"; else echo "Container ready. Sleeping..."; tail -f /dev/null; fi' \
+    > /usr/local/bin/start.sh \
+ && chmod +x /usr/local/bin/start.sh
+
+WORKDIR /workspace
+CMD ["/usr/local/bin/start.sh"]
